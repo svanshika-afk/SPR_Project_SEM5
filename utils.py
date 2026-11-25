@@ -106,10 +106,10 @@ def trim_silence(y, sr, top_db=25, min_duration=0.12):
     if y.size == 0:
         return y, False
     peak = float(np.max(np.abs(y)))
-    if peak < 1e-3:
+    if peak < 1e-4:
         return y, False
     trimmed, _ = librosa.effects.trim(y, top_db=top_db, frame_length=512, hop_length=128)
-    is_valid = (len(trimmed) / float(sr)) >= min_duration and float(np.max(np.abs(trimmed))) >= 1e-3
+    is_valid = (len(trimmed) / float(sr)) >= min_duration and float(np.max(np.abs(trimmed))) >= 1e-4
     return trimmed, is_valid
 
 

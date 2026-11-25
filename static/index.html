@@ -72,6 +72,10 @@
   <h1>Voice-PIN Security Demo</h1>
   <p class="subtitle">Spoken-digit recognition (DTW / GMM / HMM) + GMM-UBM speaker verification</p>
 
+  <div class="row" style="margin-bottom:12px">
+    <label>Microphone: <select id="mic-select" style="max-width:340px"><option value="">Default Microphone</option></select></label>
+  </div>
+
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab('unlock')">1. Unlock Demo</button>
     <button class="tab-btn" onclick="switchTab('enroll')">2. Record Voice</button>
@@ -96,7 +100,7 @@
     <hr style="border:0; border-top:1px solid var(--border); margin:16px 0" />
     <div class="row">
       <label>Model: <select id="model-select"></select></label>
-      <label>Target PIN: <input id="target-pin-input" value="1234" maxlength="8" style="width:90px" /></label>
+      <label>Target PIN: <input id="target-pin-input" value="1234" maxlength="8" style="width:80px" /></label>
       <button onclick="setTargetPin()">Set PIN</button>
     </div>
     <div class="row">
@@ -245,94 +249,143 @@ function encodeWav(samples, sampleRate) {
   return new Blob([view], { type: "audio/wav" });
 }
 
+async function populateMics() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mics = devices.filter(d => d.kind === "audioinput");
+    const sel = document.getElementById("mic-select");
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">Default Microphone</option>';
+    mics.forEach((m, i) => {
+      const opt = document.createElement("option");
+      opt.value = m.deviceId;
+      opt.textContent = m.label || `Microphone ${i + 1}`;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+  } catch (_) {}
+}
+
 async function startMic(targetMode, meterId, logId) {
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-  });
-  audioCtx = new AudioContext();
-  await audioCtx.audioWorklet.addModule("/static/vad-processor.js");
-  const src = audioCtx.createMediaStreamSource(micStream);
-  workletNode = new AudioWorkletNode(audioCtx, "vad-processor");
+  try {
+    const micId = document.getElementById("mic-select").value;
+    const audioConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: true
+    };
+    if (micId) audioConstraints.deviceId = { exact: micId };
 
-  const sr = audioCtx.sampleRate;
-  const preRollMax = Math.ceil(0.21 * sr);
-  const hangoverMax = Math.ceil(0.45 * sr);
-  const minSpeechSamples = Math.ceil(0.09 * sr);
-  const maxClipSamples = Math.ceil(1.6 * sr);
-  const calibTarget = Math.ceil(0.55 * sr);
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+    populateMics();
 
-  vadState = {
-    calibrating: true, calibSamples: 0, calibRms: [],
-    noiseFloor: 0.01, onsetThresh: 0.025,
-    inSpeech: false, activeSamples: 0, silenceSamples: 0,
-    preRoll: [], speechChunks: [], speechLen: 0, sr
-  };
+    audioCtx = new AudioContext();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    await audioCtx.audioWorklet.addModule("/static/vad-processor.js");
 
-  document.getElementById(logId).textContent = "Calibrating room noise (0.5s)... stay quiet.";
+    const src = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx, "vad-processor");
+    const muteGain = audioCtx.createGain();
+    muteGain.gain.value = 0;
 
-  workletNode.port.onmessage = (ev) => {
-    const chunk = ev.data;
-    let sumSq = 0;
-    for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
-    const rms = Math.sqrt(sumSq / chunk.length);
-    const pct = Math.min(100, (rms / 0.15) * 100);
-    document.getElementById(meterId).style.width = pct + "%";
+    const sr = audioCtx.sampleRate;
+    const preRollMax = Math.ceil(0.21 * sr);
+    const hangoverMax = Math.ceil(0.45 * sr);
+    const minSpeechSamples = Math.ceil(0.08 * sr);
+    const maxClipSamples = Math.ceil(1.6 * sr);
+    const calibTarget = Math.ceil(0.5 * sr);
 
-    if (vadState.calibrating) {
-      vadState.calibRms.push(rms);
-      vadState.calibSamples += chunk.length;
-      if (vadState.calibSamples >= calibTarget) {
-        vadState.calibRms.sort((a, b) => a - b);
-        const med = vadState.calibRms[Math.floor(vadState.calibRms.length / 2)] || 0.008;
-        vadState.noiseFloor = Math.max(0.004, med);
-        vadState.onsetThresh = Math.max(0.015, vadState.noiseFloor * 3.2);
-        vadState.calibrating = false;
-        document.getElementById(logId).textContent =
-          targetMode === "unlock" ? "Listening... speak a digit 0–9." : `Speak digit ${selectedDigit} now...`;
+    vadState = {
+      calibrating: true, calibSamples: 0, calibRms: [],
+      noiseFloor: 0.002, onsetThresh: 0.006,
+      inSpeech: false, activeSamples: 0, silenceSamples: 0,
+      preRoll: [], speechChunks: [], speechLen: 0,
+      rawChunks: [], rawLen: 0, savedInSession: false, sr
+    };
+
+    document.getElementById(logId).textContent = "Calibrating room noise (0.5s)... stay quiet.";
+
+    workletNode.port.onmessage = (ev) => {
+      const chunk = ev.data;
+      let sumSq = 0;
+      for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
+      const rms = Math.sqrt(sumSq / chunk.length);
+      // Logarithmic dB meter (-55 dB to -5 dB) so normal mic levels are clearly visible
+      const db = 20 * Math.log10(Math.max(rms, 1e-5));
+      const pct = Math.max(0, Math.min(100, ((db + 55) / 50) * 100));
+      document.getElementById(meterId).style.width = pct + "%";
+
+      if (vadState.calibrating) {
+        vadState.calibRms.push(rms);
+        vadState.calibSamples += chunk.length;
+        if (vadState.calibSamples >= calibTarget) {
+          vadState.calibRms.sort((a, b) => a - b);
+          const med = vadState.calibRms[Math.floor(vadState.calibRms.length / 2)] || 0.001;
+          vadState.noiseFloor = Math.max(0.0005, med);
+          vadState.onsetThresh = Math.max(0.003, vadState.noiseFloor * 2.5);
+          vadState.calibrating = false;
+          document.getElementById(logId).textContent =
+            targetMode === "unlock"
+              ? `Listening... speak a digit 0–9 (threshold=${vadState.onsetThresh.toFixed(4)}).`
+              : `Speak digit ${selectedDigit} now...`;
+        }
+        return;
       }
-      return;
-    }
 
-    if (!vadState.inSpeech) {
-      vadState.preRoll.push(chunk);
-      let preLen = vadState.preRoll.reduce((a, b) => a + b.length, 0);
-      while (preLen > preRollMax && vadState.preRoll.length > 1) {
-        preLen -= vadState.preRoll.shift().length;
+      if (targetMode === "enroll") {
+        vadState.rawChunks.push(chunk);
+        vadState.rawLen += chunk.length;
       }
-      if (rms > vadState.onsetThresh) {
-        vadState.activeSamples += chunk.length;
-        if (vadState.activeSamples >= minSpeechSamples) {
-          vadState.inSpeech = true;
-          vadState.speechChunks = [...vadState.preRoll];
-          vadState.speechLen = preLen;
-          vadState.silenceSamples = 0;
-          document.getElementById(logId).textContent = "Capturing speech...";
+
+      if (!vadState.inSpeech) {
+        vadState.preRoll.push(chunk);
+        let preLen = vadState.preRoll.reduce((a, b) => a + b.length, 0);
+        while (preLen > preRollMax && vadState.preRoll.length > 1) {
+          preLen -= vadState.preRoll.shift().length;
+        }
+        if (rms > vadState.onsetThresh) {
+          vadState.activeSamples += chunk.length;
+          if (vadState.activeSamples >= minSpeechSamples) {
+            vadState.inSpeech = true;
+            vadState.speechChunks = [...vadState.preRoll];
+            vadState.speechLen = preLen;
+            vadState.silenceSamples = 0;
+            document.getElementById(logId).textContent = "Capturing speech...";
+          }
+        } else {
+          vadState.activeSamples = 0;
         }
       } else {
-        vadState.activeSamples = 0;
-      }
-    } else {
-      vadState.speechChunks.push(chunk);
-      vadState.speechLen += chunk.length;
-      if (rms > vadState.onsetThresh * 0.7) vadState.silenceSamples = 0;
-      else vadState.silenceSamples += chunk.length;
+        vadState.speechChunks.push(chunk);
+        vadState.speechLen += chunk.length;
+        if (rms > vadState.onsetThresh * 0.7) vadState.silenceSamples = 0;
+        else vadState.silenceSamples += chunk.length;
 
-      if (vadState.silenceSamples >= hangoverMax || vadState.speechLen >= maxClipSamples) {
-        const merged = mergeChunks(vadState.speechChunks, vadState.speechLen);
-        vadState.inSpeech = false;
-        vadState.activeSamples = 0;
-        vadState.silenceSamples = 0;
-        vadState.speechChunks = [];
-        vadState.speechLen = 0;
-        if (targetMode === "unlock") handleUnlockClip(merged, sr);
-        else handleEnrollClip(merged, sr);
+        if (vadState.silenceSamples >= hangoverMax || vadState.speechLen >= maxClipSamples) {
+          const merged = mergeChunks(vadState.speechChunks, vadState.speechLen);
+          vadState.inSpeech = false;
+          vadState.activeSamples = 0;
+          vadState.silenceSamples = 0;
+          vadState.speechChunks = [];
+          vadState.speechLen = 0;
+          vadState.rawChunks = [];
+          vadState.rawLen = 0;
+          vadState.savedInSession = true;
+          if (targetMode === "unlock") handleUnlockClip(merged, sr);
+          else handleEnrollClip(merged, sr);
+        }
       }
-    }
-  };
+    };
 
-  src.connect(workletNode);
-  workletNode.connect(audioCtx.destination);
-  mode = targetMode;
+    src.connect(workletNode);
+    workletNode.connect(muteGain);
+    muteGain.connect(audioCtx.destination);
+    mode = targetMode;
+  } catch (err) {
+    document.getElementById(logId).textContent = "Mic error: " + (err.message || err);
+    stopMic();
+  }
 }
 
 function mergeChunks(chunks, totalLen) {
@@ -343,11 +396,17 @@ function mergeChunks(chunks, totalLen) {
 }
 
 function stopMic() {
-  // If user clicks Stop during enroll while speech was captured, auto-save it!
-  if (mode === "enroll" && vadState && vadState.inSpeech && vadState.speechLen > 0) {
-    const merged = mergeChunks(vadState.speechChunks, vadState.speechLen);
-    handleEnrollClip(merged, vadState.sr);
+  // If user clicks Stop & Save during enroll, save captured speech or full un-saved buffer
+  if (mode === "enroll" && vadState) {
+    if (vadState.inSpeech && vadState.speechLen > 0) {
+      const merged = mergeChunks(vadState.speechChunks, vadState.speechLen);
+      handleEnrollClip(merged, vadState.sr);
+    } else if (!vadState.savedInSession && vadState.rawLen > 0) {
+      const merged = mergeChunks(vadState.rawChunks, vadState.rawLen);
+      handleEnrollClip(merged, vadState.sr);
+    }
   }
+  vadState = null;
   if (workletNode) { workletNode.disconnect(); workletNode = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
@@ -536,6 +595,7 @@ function setTargetPin() {
 }
 
 refreshStatus();
+populateMics();
 renderPinDisplay();
 </script>
 </body>

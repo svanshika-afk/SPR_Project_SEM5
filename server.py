@@ -135,8 +135,12 @@ async def enroll_clip(
 
     trimmed, is_valid = trim_silence(y, SAMPLE_RATE, top_db=25, min_duration=0.12)
     dur = len(trimmed) / float(SAMPLE_RATE)
+    raw_peak = float(np.max(np.abs(y))) if y.size else 0.0
     if not is_valid:
-        return {"saved": False, "reason": "Too quiet or too short — please speak clearly and try again."}
+        return {
+            "saved": False,
+            "reason": f"Too quiet or too short (peak={raw_peak:.4f}, trimmed={dur:.2f}s) — check mic selection or speak louder.",
+        }
     if dur > MAX_CLIP_SEC:
         return {"saved": False, "reason": f"Clip too long ({dur:.2f}s) — speak only one digit."}
 
