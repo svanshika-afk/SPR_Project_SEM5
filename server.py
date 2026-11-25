@@ -31,7 +31,7 @@ from utils import load_models, mfcc_from_array, trim_silence
 
 
 SAMPLE_RATE = 22050
-MIN_CLIP_SEC = 0.18
+MIN_CLIP_SEC = 0.16
 MAX_CLIP_SEC = 1.25
 
 MODEL_SPECS = {
@@ -50,6 +50,7 @@ state = {
     "models": {},
     "thresholds": {},
     "speaker_verifier": None,
+    "cmvn": False,
 }
 
 
@@ -69,6 +70,10 @@ def reload_models():
 
     spk_path = "./models/speaker_verifier.joblib"
     state["speaker_verifier"] = load_models(spk_path) if os.path.isfile(spk_path) else None
+
+    cfg_path = "./models/train_config.joblib"
+    cfg = load_models(cfg_path) if os.path.isfile(cfg_path) else {}
+    state["cmvn"] = bool(cfg.get("cmvn", False))
 
 
 reload_models()
@@ -231,7 +236,7 @@ async def predict_clip(
         return {"accepted": False, "reason": f"Too long ({dur:.2f}s) — please pause between digits.", "duration_sec": round(dur, 2)}
 
     _, predict_fn, min_margin = MODEL_SPECS[model]
-    feats = mfcc_from_array(trimmed, SAMPLE_RATE, delta=2, cmvn=False)
+    feats = mfcc_from_array(trimmed, SAMPLE_RATE, delta=2, cmvn=state["cmvn"])
     digit, margin, scores = predict_fn(state["models"][model], feats)
 
     # Rejection gate 1: margin between top-1 and top-2
@@ -258,10 +263,12 @@ async def predict_clip(
                 "duration_sec": round(dur, 2),
             }
 
-    # Optional two-factor GMM-UBM speaker verification
+    # Optional two-factor GMM-UBM speaker verification (uses CMVN to remove mic/channel bias)
     spk_ok, spk_llr, spk_thresh = True, 0.0, 0.0
     if verify_spk and state["speaker_verifier"] is not None:
-        spk_ok, spk_llr, spk_thresh = verify_speaker(state["speaker_verifier"], feats)
+        spk_cmvn = state["speaker_verifier"].get("cmvn", False)
+        spk_feats = feats if spk_cmvn == state["cmvn"] else mfcc_from_array(trimmed, SAMPLE_RATE, delta=2, cmvn=spk_cmvn)
+        spk_ok, spk_llr, spk_thresh = verify_speaker(state["speaker_verifier"], spk_feats)
 
     return {
         "accepted": True,

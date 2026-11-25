@@ -94,10 +94,11 @@ def train_all_models(train_dir=None, test_dir=None, cmvn=False, owner=None):
     results.append(evaluate("HMM (custom)", hmm_custom, hmm.predict_from_features, test_dir, cmvn))
 
     save_models(thresholds, "./models/score_thresholds.joblib")
+    save_models({"cmvn": cmvn}, "./models/train_config.joblib")
 
     speaker_trained = None
     if owner:
-        verifier = train_speaker_verifier(owner, cmvn=cmvn)
+        verifier = train_speaker_verifier(owner, cmvn=True)
         if verifier is not None:
             save_models(verifier, "./models/speaker_verifier.joblib")
             speaker_trained = owner

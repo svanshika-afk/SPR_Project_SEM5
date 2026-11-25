@@ -100,6 +100,13 @@
     <hr style="border:0; border-top:1px solid var(--border); margin:16px 0" />
     <div class="row">
       <label>Model: <select id="model-select"></select></label>
+      <label>Environment:
+        <select id="sensitivity-select">
+          <option value="8" selected>Normal Room (+8 dB)</option>
+          <option value="12">Noisy Room (+12 dB)</option>
+          <option value="6">Quiet / Soft Voice (+6 dB)</option>
+        </select>
+      </label>
       <label>Target PIN: <input id="target-pin-input" value="1234" maxlength="8" style="width:80px" /></label>
       <button onclick="setTargetPin()">Set PIN</button>
     </div>
@@ -154,7 +161,8 @@ let vadState = null;
 
 let targetPin = "1234";
 let enteredPin = "";
-let speakerVotes = [];
+let speakerLlrs = [];
+let lastSpkThreshold = 0.0;
 let selectedDigit = 0;
 let enrolledData = {};
 
@@ -290,15 +298,16 @@ async function startMic(targetMode, meterId, logId) {
     muteGain.gain.value = 0;
 
     const sr = audioCtx.sampleRate;
-    const preRollMax = Math.ceil(0.21 * sr);
-    const hangoverMax = Math.ceil(0.45 * sr);
-    const minSpeechSamples = Math.ceil(0.08 * sr);
+    const preRollMax = Math.ceil(0.20 * sr);
+    const hangoverMax = Math.ceil(0.35 * sr);
+    const minSpeechSamples = Math.ceil(0.06 * sr);
     const maxClipSamples = Math.ceil(1.6 * sr);
     const calibTarget = Math.ceil(0.5 * sr);
+    const marginDb = parseFloat(document.getElementById("sensitivity-select").value) || 8.0;
 
     vadState = {
-      calibrating: true, calibSamples: 0, calibRms: [],
-      noiseFloor: 0.002, onsetThresh: 0.006,
+      calibrating: true, calibSamples: 0, calibDbs: [],
+      noiseDb: -50.0, marginDb,
       inSpeech: false, activeSamples: 0, silenceSamples: 0,
       preRoll: [], speechChunks: [], speechLen: 0,
       rawChunks: [], rawLen: 0, savedInSession: false, sr
@@ -311,23 +320,22 @@ async function startMic(targetMode, meterId, logId) {
       let sumSq = 0;
       for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
       const rms = Math.sqrt(sumSq / chunk.length);
-      // Logarithmic dB meter (-55 dB to -5 dB) so normal mic levels are clearly visible
       const db = 20 * Math.log10(Math.max(rms, 1e-5));
       const pct = Math.max(0, Math.min(100, ((db + 55) / 50) * 100));
       document.getElementById(meterId).style.width = pct + "%";
 
       if (vadState.calibrating) {
-        vadState.calibRms.push(rms);
+        vadState.calibDbs.push(db);
         vadState.calibSamples += chunk.length;
         if (vadState.calibSamples >= calibTarget) {
-          vadState.calibRms.sort((a, b) => a - b);
-          const med = vadState.calibRms[Math.floor(vadState.calibRms.length / 2)] || 0.001;
-          vadState.noiseFloor = Math.max(0.0005, med);
-          vadState.onsetThresh = Math.max(0.003, vadState.noiseFloor * 2.5);
+          vadState.calibDbs.sort((a, b) => a - b);
+          const medDb = vadState.calibDbs[Math.floor(vadState.calibDbs.length * 0.5)] || -50.0;
+          vadState.noiseDb = Math.max(-65.0, Math.min(-22.0, medDb));
           vadState.calibrating = false;
+          const trigDb = (vadState.noiseDb + vadState.marginDb).toFixed(1);
           document.getElementById(logId).textContent =
             targetMode === "unlock"
-              ? `Listening... speak a digit 0–9 (threshold=${vadState.onsetThresh.toFixed(4)}).`
+              ? `Listening... speak normally (noise=${vadState.noiseDb.toFixed(1)} dB, trigger=${trigDb} dB).`
               : `Speak digit ${selectedDigit} now...`;
         }
         return;
@@ -338,13 +346,20 @@ async function startMic(targetMode, meterId, logId) {
         vadState.rawLen += chunk.length;
       }
 
+      const onsetDb = vadState.noiseDb + vadState.marginDb;
+      const holdDb = vadState.noiseDb + Math.max(3.0, vadState.marginDb * 0.5);
+
       if (!vadState.inSpeech) {
+        // Slowly adapt noise floor during silence so AGC drift never locks out normal speech
+        if (db < onsetDb) {
+          vadState.noiseDb = 0.96 * vadState.noiseDb + 0.04 * Math.min(-22.0, db);
+        }
         vadState.preRoll.push(chunk);
         let preLen = vadState.preRoll.reduce((a, b) => a + b.length, 0);
         while (preLen > preRollMax && vadState.preRoll.length > 1) {
           preLen -= vadState.preRoll.shift().length;
         }
-        if (rms > vadState.onsetThresh) {
+        if (db > onsetDb) {
           vadState.activeSamples += chunk.length;
           if (vadState.activeSamples >= minSpeechSamples) {
             vadState.inSpeech = true;
@@ -359,7 +374,7 @@ async function startMic(targetMode, meterId, logId) {
       } else {
         vadState.speechChunks.push(chunk);
         vadState.speechLen += chunk.length;
-        if (rms > vadState.onsetThresh * 0.7) vadState.silenceSamples = 0;
+        if (db > holdDb) vadState.silenceSamples = 0;
         else vadState.silenceSamples += chunk.length;
 
         if (vadState.silenceSamples >= hangoverMax || vadState.speechLen >= maxClipSamples) {
@@ -461,7 +476,8 @@ async function handleUnlockClip(samples, sr) {
 
   enteredPin += String(data.digit);
   if (document.getElementById("verify-speaker").checked) {
-    speakerVotes.push(data.speaker_ok);
+    speakerLlrs.push(data.speaker_llr);
+    lastSpkThreshold = data.speaker_threshold;
   }
   renderPinDisplay();
   let msg = `Detected: ${data.digit} (margin=${data.margin}, ${data.duration_sec}s)`;
@@ -474,7 +490,8 @@ async function handleUnlockClip(samples, sr) {
     const banner = document.getElementById("status-banner");
     const pinOk = enteredPin === targetPin;
     const spkRequired = document.getElementById("verify-speaker").checked;
-    const spkOk = !spkRequired || (speakerVotes.filter(Boolean).length >= Math.ceil(speakerVotes.length / 2));
+    const avgLlr = speakerLlrs.length ? (speakerLlrs.reduce((a, b) => a + b, 0) / speakerLlrs.length) : 0;
+    const spkOk = !spkRequired || (avgLlr >= lastSpkThreshold);
 
     if (pinOk && spkOk) {
       banner.textContent = "UNLOCKED — ACCESS GRANTED";
@@ -568,7 +585,7 @@ function renderPinDisplay() {
 function backspacePin() {
   if (enteredPin.length > 0) {
     enteredPin = enteredPin.slice(0, -1);
-    speakerVotes.pop();
+    speakerLlrs.pop();
     renderPinDisplay();
     document.getElementById("status-banner").textContent = "LOCKED";
     document.getElementById("status-banner").className = "banner locked";
@@ -577,7 +594,7 @@ function backspacePin() {
 
 function clearAndLock() {
   enteredPin = "";
-  speakerVotes = [];
+  speakerLlrs = [];
   renderPinDisplay();
   document.getElementById("status-banner").textContent = "LOCKED";
   document.getElementById("status-banner").className = "banner locked";

@@ -68,10 +68,10 @@ def map_adapt_ubm(ubm, owner_X, relevance_factor=16.0):
     return adapted
 
 
-def train_speaker_verifier(owner_name, my_records_dir="./my_records", background_dir="./processed_train_records", n_components=16, cmvn=False):
+def train_speaker_verifier(owner_name, my_records_dir="./my_records", background_dir="./processed_train_records", n_components=24, cmvn=True):
     """
-    Train UBM + MAP-adapted owner GMM.
-    Returns a dict with {'owner': owner_name, 'ubm': ubm, 'owner_gmm': owner_gmm, 'threshold': float}
+    Train UBM + MAP-adapted owner GMM (always uses CMVN by default to remove microphone/channel bias).
+    Returns a dict with {'owner': owner_name, 'ubm': ubm, 'owner_gmm': owner_gmm, 'threshold': float, 'cmvn': bool}
     or None if no recordings exist for `owner_name`.
     """
     enrolled = collect_speaker_features(my_records_dir, cmvn=cmvn)
@@ -96,21 +96,22 @@ def train_speaker_verifier(owner_name, my_records_dir="./my_records", background
     np.seterr(all='ignore')
     ubm.fit(ubm_X)
 
-    owner_gmm = map_adapt_ubm(ubm, owner_X, relevance_factor=16.0)
+    owner_gmm = map_adapt_ubm(ubm, owner_X, relevance_factor=8.0)
 
     # Calibrate LLR threshold using owner vs background utterances
     owner_llrs = [float(owner_gmm.score(s) - ubm.score(s)) for s in owner_seqs]
     if bg_seqs:
-        bg_llrs = [float(owner_gmm.score(s) - ubm.score(s)) for s in bg_seqs[:40]]
-        threshold = 0.5 * (float(np.percentile(owner_llrs, 15)) + float(np.percentile(bg_llrs, 85)))
+        bg_llrs = [float(owner_gmm.score(s) - ubm.score(s)) for s in bg_seqs[:60]]
+        threshold = 0.5 * (float(np.percentile(owner_llrs, 20)) + float(np.percentile(bg_llrs, 90)))
     else:
-        threshold = float(np.percentile(owner_llrs, 10)) - 0.5
+        threshold = float(np.percentile(owner_llrs, 15)) - 0.3
 
     return {
         "owner": owner_name,
         "ubm": ubm,
         "owner_gmm": owner_gmm,
         "threshold": float(threshold),
+        "cmvn": bool(cmvn),
     }
 
 
